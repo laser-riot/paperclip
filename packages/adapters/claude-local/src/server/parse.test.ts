@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   extractClaudeRetryNotBefore,
   isClaudeTransientUpstreamError,
+  parseClaudeStreamJson,
 } from "./parse.js";
+
+function buildStreamJson(events: Array<Record<string, unknown>>): string {
+  return events.map((event) => JSON.stringify(event)).join("\n");
+}
 
 describe("isClaudeTransientUpstreamError", () => {
   it("classifies the 'out of extra usage' subscription window failure as transient", () => {
@@ -93,6 +98,101 @@ describe("isClaudeTransientUpstreamError", () => {
         errorMessage: "Invalid request_error: Unknown parameter 'foo'.",
       }),
     ).toBe(false);
+  });
+});
+
+describe("parseClaudeStreamJson cost reporting", () => {
+  const baseEvents = [
+    { type: "system", subtype: "init", session_id: "s-1", model: "claude-opus-4-7" },
+    {
+      type: "assistant",
+      session_id: "s-1",
+      message: { content: [{ type: "text", text: "ok" }] },
+    },
+  ];
+
+  it("passes through a positive total_cost_usd as actual cost", () => {
+    const stdout = buildStreamJson([
+      ...baseEvents,
+      {
+        type: "result",
+        session_id: "s-1",
+        result: "done",
+        total_cost_usd: 0.42,
+        usage: { input_tokens: 100, cache_read_input_tokens: 0, output_tokens: 50 },
+      },
+    ]);
+
+    const parsed = parseClaudeStreamJson(stdout);
+    expect(parsed.costUsd).toBe(0.42);
+    expect(parsed.costSource).toBe("actual");
+  });
+
+  it("estimates cost when total_cost_usd is 0 and tokens were spent (subscription auth)", () => {
+    const stdout = buildStreamJson([
+      ...baseEvents,
+      {
+        type: "result",
+        session_id: "s-1",
+        result: "done",
+        total_cost_usd: 0,
+        usage: {
+          input_tokens: 1_000_000,
+          cache_read_input_tokens: 0,
+          output_tokens: 0,
+        },
+      },
+    ]);
+
+    const parsed = parseClaudeStreamJson(stdout);
+    // Opus input: 15 / 5 = 3.00
+    expect(parsed.costSource).toBe("estimated");
+    expect(parsed.costUsd ?? 0).toBeCloseTo(3.0, 5);
+  });
+
+  it("keeps cost at 0 / actual when total_cost_usd is 0 and no tokens were spent", () => {
+    const stdout = buildStreamJson([
+      ...baseEvents,
+      {
+        type: "result",
+        session_id: "s-1",
+        result: "done",
+        total_cost_usd: 0,
+        usage: { input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 },
+      },
+    ]);
+
+    const parsed = parseClaudeStreamJson(stdout);
+    expect(parsed.costUsd).toBe(0);
+    expect(parsed.costSource).toBe("actual");
+  });
+
+  it("estimates cost when total_cost_usd is missing entirely but usage is reported", () => {
+    const stdout = buildStreamJson([
+      ...baseEvents,
+      {
+        type: "result",
+        session_id: "s-1",
+        result: "done",
+        usage: {
+          input_tokens: 0,
+          cache_read_input_tokens: 0,
+          output_tokens: 1_000_000,
+        },
+      },
+    ]);
+
+    const parsed = parseClaudeStreamJson(stdout);
+    // Opus output: 75 / 5 = 15.00
+    expect(parsed.costSource).toBe("estimated");
+    expect(parsed.costUsd ?? 0).toBeCloseTo(15.0, 5);
+  });
+
+  it("reports costSource=unknown when no result event is emitted", () => {
+    const stdout = buildStreamJson(baseEvents);
+    const parsed = parseClaudeStreamJson(stdout);
+    expect(parsed.costUsd).toBeNull();
+    expect(parsed.costSource).toBe("unknown");
   });
 });
 

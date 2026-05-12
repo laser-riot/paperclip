@@ -54,7 +54,9 @@ import {
   isClaudeMaxTurnsResult,
   isClaudeTransientUpstreamError,
   isClaudeUnknownSessionError,
+  type ClaudeCostSource,
 } from "./parse.js";
+import { estimateClaudeCostUsd } from "./pricing.js";
 import { prepareClaudeConfigSeed } from "./claude-config.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
@@ -896,12 +898,44 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : transientUpstream
       ? "claude_transient_upstream"
       : null;
+    const effectiveModel = parsedStream.model || asString(parsed.model, model);
+    const hasUsageTokens =
+      usage.inputTokens > 0 || (usage.cachedInputTokens ?? 0) > 0 || usage.outputTokens > 0;
+
+    // Prefer the value from parseClaudeStreamJson (which already handles
+    // estimation for subscription auth). Fall back to total_cost_usd from the
+    // single-line `parsed` payload, then to a per-model token estimate when
+    // the CLI reports $0 despite real token usage (Max/Pro subscription).
+    let resolvedCostUsd: number | null = parsedStream.costUsd;
+    let resolvedCostSource: ClaudeCostSource = parsedStream.costSource;
+    if (resolvedCostUsd === null) {
+      const fallbackCostRaw = parsed.total_cost_usd;
+      const fallbackCost =
+        typeof fallbackCostRaw === "number" && Number.isFinite(fallbackCostRaw)
+          ? fallbackCostRaw
+          : null;
+      if (fallbackCost !== null && fallbackCost > 0) {
+        resolvedCostUsd = fallbackCost;
+        resolvedCostSource = "actual";
+      } else if (hasUsageTokens) {
+        resolvedCostUsd = estimateClaudeCostUsd({ model: effectiveModel, usage }).costUsd;
+        resolvedCostSource = "estimated";
+      } else if (fallbackCost === 0) {
+        resolvedCostUsd = 0;
+        resolvedCostSource = "actual";
+      } else {
+        resolvedCostUsd = 0;
+        resolvedCostSource = "unknown";
+      }
+    }
+
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
       ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
       ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
+      costSource: resolvedCostSource,
     };
 
     return {
@@ -919,9 +953,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       sessionDisplayId: resolvedSessionId,
       provider: "anthropic",
       biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
-      model: parsedStream.model || asString(parsed.model, model),
+      model: effectiveModel,
       billingType,
-      costUsd: parsedStream.costUsd ?? asNumber(parsed.total_cost_usd, 0),
+      costUsd: resolvedCostUsd ?? 0,
       resultJson: mergedResultJson,
       summary: parsedStream.summary || asString(parsed.result, ""),
       clearSession: clearSessionForMaxTurns || Boolean(opts.clearSessionOnMissingSession && !resolvedSessionId),

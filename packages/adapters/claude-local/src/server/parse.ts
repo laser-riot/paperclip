@@ -5,6 +5,9 @@ import {
   parseObject,
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
+import { estimateClaudeCostUsd } from "./pricing.js";
+
+export type ClaudeCostSource = "actual" | "estimated" | "unknown";
 
 const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+`?claude\s+login`?|login\s+required|requires\s+login|unauthorized|authentication\s+required)/i;
 const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
@@ -59,6 +62,7 @@ export function parseClaudeStreamJson(stdout: string) {
       sessionId,
       model,
       costUsd: null as number | null,
+      costSource: "unknown" as ClaudeCostSource,
       usage: null as UsageSummary | null,
       summary: assistantTexts.join("\n\n").trim(),
       resultJson: null as Record<string, unknown> | null,
@@ -72,13 +76,31 @@ export function parseClaudeStreamJson(stdout: string) {
     outputTokens: asNumber(usageObj.output_tokens, 0),
   };
   const costRaw = finalResult.total_cost_usd;
-  const costUsd = typeof costRaw === "number" && Number.isFinite(costRaw) ? costRaw : null;
+  const reportedCost = typeof costRaw === "number" && Number.isFinite(costRaw) ? costRaw : null;
+  const hasUsageTokens =
+    usage.inputTokens > 0 || (usage.cachedInputTokens ?? 0) > 0 || usage.outputTokens > 0;
+
+  // The Claude Code CLI reports total_cost_usd: 0 for subscription auth even
+  // though tokens were spent. Fall back to a per-model estimate so callers
+  // see a non-zero figure for telemetry; mark the source so downstream
+  // readers can distinguish real billing from estimates.
+  let costUsd: number | null = reportedCost;
+  let costSource: ClaudeCostSource = reportedCost !== null && reportedCost > 0 ? "actual" : "unknown";
+  if ((reportedCost === null || reportedCost === 0) && hasUsageTokens) {
+    const estimate = estimateClaudeCostUsd({ model, usage });
+    costUsd = estimate.costUsd;
+    costSource = "estimated";
+  } else if (reportedCost === 0 && !hasUsageTokens) {
+    costUsd = 0;
+    costSource = "actual";
+  }
   const summary = asString(finalResult.result, assistantTexts.join("\n\n")).trim();
 
   return {
     sessionId,
     model,
     costUsd,
+    costSource,
     usage,
     summary,
     resultJson: finalResult,
